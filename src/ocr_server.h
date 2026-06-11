@@ -10,9 +10,12 @@ namespace ocr {
 
 class OcrServer {
 public:
-    /// Construct the server with a shared OcrEngine reference.
-    /// The engine must outlive the server.
-    explicit OcrServer(OcrEngine& engine);
+    using RecognizeFn = std::function<OcrResponse(const uint8_t*, int, int, int)>;
+    using VersionFn = std::function<const char*()>;
+
+    /// Construct the server with OCR callbacks.
+    /// The supplied callbacks must remain valid for the server lifetime.
+    OcrServer(RecognizeFn recognize, VersionFn version);
     ~OcrServer();
 
     // Non-copyable

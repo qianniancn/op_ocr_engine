@@ -1,6 +1,7 @@
 # Build directories
 /build/
 /build_service/
+/build-vs*/
 
 # CMake generated files
 /CMakeCache.txt
@@ -35,8 +36,13 @@ build_output.txt
 cmake_output.txt
 
 # Local runtime/test assets
+/3rd_party/
+/images/
 /tessdata/
 /tmp/
+
+# Generated source assets
+/src/ppocrv5_dict.h
 
 # Python Virtual Environments
 .venv-paddle/

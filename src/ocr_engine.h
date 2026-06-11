@@ -13,6 +13,18 @@ struct OcrResult {
     float confidence;
 };
 
+struct OcrProfile {
+    double det_ms = 0.0;
+    double cls_ms = 0.0;
+    double rec_ms = 0.0;
+    double total_ms = 0.0;
+};
+
+struct OcrResponse {
+    std::vector<OcrResult> results;
+    OcrProfile profile;
+};
+
 class OcrEngine {
 public:
     OcrEngine();

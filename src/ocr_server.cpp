@@ -53,11 +53,13 @@ using json = nlohmann::json;
 namespace ocr {
 
 struct OcrServer::Impl {
-    OcrEngine& engine;
+    RecognizeFn recognize;
+    VersionFn version;
     httplib::Server svr;
-    std::mutex ocr_mutex;  // Tesseract is not thread-safe
+    std::mutex ocr_mutex;
 
-    explicit Impl(OcrEngine& eng) : engine(eng) {}
+    Impl(RecognizeFn recognize_fn, VersionFn version_fn)
+        : recognize(std::move(recognize_fn)), version(std::move(version_fn)) {}
 
     void setup_routes() {
         // Health check
@@ -66,9 +68,9 @@ struct OcrServer::Impl {
         });
 
         // Version
-        svr.Get("/api/v1/version", [](const httplib::Request&, httplib::Response& res) {
+        svr.Get("/api/v1/version", [this](const httplib::Request&, httplib::Response& res) {
             json j;
-            j["version"] = OcrEngine::version();
+            j["version"] = version ? version() : "unknown";
             res.set_content(j.dump(), "application/json");
         });
 
@@ -132,18 +134,27 @@ struct OcrServer::Impl {
             return;
         }
 
-        // Perform OCR (thread-safe via mutex)
-        std::vector<OcrResult> results;
+        // Perform OCR. We keep a mutex here so the server remains safe for
+        // non-thread-safe backends such as Tesseract.
+        OcrResponse ocr_response;
         {
             std::lock_guard<std::mutex> lock(ocr_mutex);
-            results = engine.recognize(image_data.data(), width, height, bpp);
+            if (recognize) {
+                ocr_response = recognize(image_data.data(), width, height, bpp);
+            }
         }
 
         // Build response
         json response;
         response["code"] = 0;
+        response["profile_ms"] = {
+            {"det", ocr_response.profile.det_ms},
+            {"cls", ocr_response.profile.cls_ms},
+            {"rec", ocr_response.profile.rec_ms},
+            {"total", ocr_response.profile.total_ms},
+        };
         response["results"] = json::array();
-        for (const auto& r : results) {
+        for (const auto& r : ocr_response.results) {
             json item;
             item["text"] = r.text;
             item["bbox"] = {r.x1, r.y1, r.x2, r.y2};
@@ -155,8 +166,8 @@ struct OcrServer::Impl {
     }
 };
 
-OcrServer::OcrServer(OcrEngine& engine)
-    : impl_(std::make_unique<Impl>(engine)) {
+OcrServer::OcrServer(RecognizeFn recognize, VersionFn version)
+    : impl_(std::make_unique<Impl>(std::move(recognize), std::move(version))) {
     impl_->setup_routes();
 }
 
