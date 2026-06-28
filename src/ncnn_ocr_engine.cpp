@@ -2,6 +2,9 @@
 
 #ifdef OCR_HAS_NCNN
 #include <net.h>
+#if NCNN_VULKAN
+#include <gpu.h>
+#endif
 #endif
 
 #include <algorithm>
@@ -17,6 +20,10 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 namespace ocr {
 
@@ -37,6 +44,22 @@ struct CharacterToken {
 struct PointF {
     float x = 0.f;
     float y = 0.f;
+};
+
+struct PointI {
+    int x = 0;
+    int y = 0;
+};
+
+struct SizeF {
+    float width = 0.f;
+    float height = 0.f;
+};
+
+struct RotatedRect {
+    PointF center;
+    SizeF size;
+    float angle = 0.f;
 };
 
 struct RotatedTextBox {
@@ -118,10 +141,16 @@ static std::string decode_text(const std::vector<std::string>& dict, const std::
     int conf_count = 0;
 
     for (const auto& token : tokens) {
-        if (token.id < 0 || token.id >= static_cast<int>(dict.size()))
+        if (token.id < 0)
             continue;
 
-        text += dict[token.id];
+        if (token.id < static_cast<int>(dict.size())) {
+            text += dict[token.id];
+        } else if (token.id == static_cast<int>(dict.size()) && !text.empty() && text.back() != ' ') {
+            text += ' ';
+        } else {
+            continue;
+        }
         conf_sum += token.prob;
         conf_count++;
     }
@@ -157,6 +186,235 @@ static float polygon_area(const std::array<PointF, 4>& points) {
         area += a.x * b.y - a.y * b.x;
     }
     return std::abs(area) * 0.5f;
+}
+
+static float polygon_area(const std::vector<PointF>& points) {
+    if (points.size() < 3)
+        return 0.f;
+
+    float area = 0.f;
+    for (size_t i = 0; i < points.size(); ++i) {
+        const auto& a = points[i];
+        const auto& b = points[(i + 1) % points.size()];
+        area += a.x * b.y - a.y * b.x;
+    }
+    return std::abs(area) * 0.5f;
+}
+
+static std::vector<PointI> convex_hull(std::vector<PointI> points) {
+    if (points.size() <= 1)
+        return points;
+
+    std::sort(points.begin(), points.end(), [](const PointI& a, const PointI& b) {
+        return a.x < b.x || (a.x == b.x && a.y < b.y);
+    });
+
+    const auto cross = [](const PointI& o, const PointI& a, const PointI& b) -> long long {
+        return static_cast<long long>(a.x - o.x) * (b.y - o.y) -
+               static_cast<long long>(a.y - o.y) * (b.x - o.x);
+    };
+
+    std::vector<PointI> hull;
+    hull.reserve(points.size() * 2);
+    for (const auto& p : points) {
+        while (hull.size() >= 2 && cross(hull[hull.size() - 2], hull.back(), p) <= 0)
+            hull.pop_back();
+        hull.push_back(p);
+    }
+
+    const size_t lower_size = hull.size();
+    for (int i = static_cast<int>(points.size()) - 2; i >= 0; --i) {
+        const auto& p = points[static_cast<size_t>(i)];
+        while (hull.size() > lower_size && cross(hull[hull.size() - 2], hull.back(), p) <= 0)
+            hull.pop_back();
+        hull.push_back(p);
+    }
+
+    if (!hull.empty())
+        hull.pop_back();
+    return hull;
+}
+
+static RotatedRect min_area_rect(const std::vector<PointI>& contour) {
+    if (contour.empty())
+        return {};
+    if (contour.size() == 1)
+        return {{static_cast<float>(contour[0].x), static_cast<float>(contour[0].y)}, {}, 0.f};
+
+    const auto hull = convex_hull(contour);
+    if (hull.size() == 2) {
+        const float cx = (hull[0].x + hull[1].x) * 0.5f;
+        const float cy = (hull[0].y + hull[1].y) * 0.5f;
+        const float dx = static_cast<float>(hull[1].x - hull[0].x);
+        const float dy = static_cast<float>(hull[1].y - hull[0].y);
+        const float len = std::sqrt(dx * dx + dy * dy);
+        const float angle = std::atan2(dy, dx) * 180.f / static_cast<float>(M_PI);
+        return {{cx, cy}, {len, 0.f}, angle};
+    }
+
+    float best_area = std::numeric_limits<float>::max();
+    RotatedRect best;
+    for (size_t i = 0; i < hull.size(); ++i) {
+        const auto& a = hull[i];
+        const auto& b = hull[(i + 1) % hull.size()];
+        const float ex = static_cast<float>(b.x - a.x);
+        const float ey = static_cast<float>(b.y - a.y);
+        const float len = std::sqrt(ex * ex + ey * ey);
+        if (len < 1e-6f)
+            continue;
+
+        const float ux = ex / len;
+        const float uy = ey / len;
+        const float vx = -uy;
+        const float vy = ux;
+        float min_u = std::numeric_limits<float>::max();
+        float max_u = std::numeric_limits<float>::lowest();
+        float min_v = std::numeric_limits<float>::max();
+        float max_v = std::numeric_limits<float>::lowest();
+
+        for (const auto& p : hull) {
+            const float px = static_cast<float>(p.x - a.x);
+            const float py = static_cast<float>(p.y - a.y);
+            const float pu = px * ux + py * uy;
+            const float pv = px * vx + py * vy;
+            min_u = std::min(min_u, pu);
+            max_u = std::max(max_u, pu);
+            min_v = std::min(min_v, pv);
+            max_v = std::max(max_v, pv);
+        }
+
+        const float rect_w = max_u - min_u;
+        const float rect_h = max_v - min_v;
+        const float area = rect_w * rect_h;
+        if (area >= best_area)
+            continue;
+
+        const float cu = (min_u + max_u) * 0.5f;
+        const float cv = (min_v + max_v) * 0.5f;
+        best_area = area;
+        best.center = {
+            static_cast<float>(a.x) + cu * ux + cv * vx,
+            static_cast<float>(a.y) + cu * uy + cv * vy,
+        };
+        best.size = {rect_w, rect_h};
+        best.angle = std::atan2(uy, ux) * 180.f / static_cast<float>(M_PI);
+    }
+
+    if (best.angle >= 90.f)
+        best.angle -= 180.f;
+    if (best.angle < -90.f)
+        best.angle += 180.f;
+    if (best.angle >= 0.f) {
+        std::swap(best.size.width, best.size.height);
+        best.angle -= 90.f;
+    }
+    return best;
+}
+
+static std::array<PointF, 4> rotated_rect_points(const RotatedRect& rect) {
+    const float half_w = rect.size.width * 0.5f;
+    const float half_h = rect.size.height * 0.5f;
+    const float angle = rect.angle * static_cast<float>(M_PI) / 180.f;
+    const float c = std::cos(angle);
+    const float s = std::sin(angle);
+
+    return {
+        PointF{rect.center.x - half_w * c + half_h * s, rect.center.y - half_w * s - half_h * c},
+        PointF{rect.center.x + half_w * c + half_h * s, rect.center.y + half_w * s - half_h * c},
+        PointF{rect.center.x + half_w * c - half_h * s, rect.center.y + half_w * s + half_h * c},
+        PointF{rect.center.x - half_w * c - half_h * s, rect.center.y - half_w * s + half_h * c},
+    };
+}
+
+static std::array<PointF, 4> order_box_points(std::array<PointF, 4> points) {
+    std::sort(points.begin(), points.end(), [](const PointF& a, const PointF& b) {
+        return a.x < b.x;
+    });
+
+    const PointF tl = points[0].y < points[1].y ? points[0] : points[1];
+    const PointF bl = points[0].y < points[1].y ? points[1] : points[0];
+    const PointF tr = points[2].y < points[3].y ? points[2] : points[3];
+    const PointF br = points[2].y < points[3].y ? points[3] : points[2];
+    return {tl, tr, br, bl};
+}
+
+static bool point_in_polygon(float x, float y, const std::vector<PointF>& polygon) {
+    bool inside = false;
+    for (size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
+        const auto& a = polygon[i];
+        const auto& b = polygon[j];
+        const bool crosses = ((a.y > y) != (b.y > y)) &&
+            (x < (b.x - a.x) * (y - a.y) / ((b.y - a.y) + 1e-6f) + a.x);
+        if (crosses)
+            inside = !inside;
+    }
+    return inside;
+}
+
+static float box_score(const ncnn::Mat& prob, const std::vector<PointF>& box) {
+    if (box.size() < 4)
+        return 0.f;
+
+    float min_x = std::numeric_limits<float>::max();
+    float min_y = std::numeric_limits<float>::max();
+    float max_x = std::numeric_limits<float>::lowest();
+    float max_y = std::numeric_limits<float>::lowest();
+    for (const auto& p : box) {
+        min_x = std::min(min_x, p.x);
+        min_y = std::min(min_y, p.y);
+        max_x = std::max(max_x, p.x);
+        max_y = std::max(max_y, p.y);
+    }
+
+    const int x1 = std::clamp(static_cast<int>(std::floor(min_x)), 0, prob.w - 1);
+    const int y1 = std::clamp(static_cast<int>(std::floor(min_y)), 0, prob.h - 1);
+    const int x2 = std::clamp(static_cast<int>(std::ceil(max_x)), x1, prob.w - 1);
+    const int y2 = std::clamp(static_cast<int>(std::ceil(max_y)), y1, prob.h - 1);
+
+    double sum = 0.0;
+    int count = 0;
+    for (int y = y1; y <= y2; ++y) {
+        const float* row = prob.row(y);
+        for (int x = x1; x <= x2; ++x) {
+            if (point_in_polygon(x + 0.5f, y + 0.5f, box)) {
+                sum += row[x];
+                count++;
+            }
+        }
+    }
+    return count > 0 ? static_cast<float>(sum / count) : 0.f;
+}
+
+static std::vector<PointF> unclip_box(const std::vector<PointF>& box, float ratio) {
+    if (box.size() < 4)
+        return box;
+
+    float cx = 0.f;
+    float cy = 0.f;
+    for (const auto& p : box) {
+        cx += p.x;
+        cy += p.y;
+    }
+    cx /= static_cast<float>(box.size());
+    cy /= static_cast<float>(box.size());
+
+    float perimeter = 0.f;
+    for (size_t i = 0; i < box.size(); ++i) {
+        perimeter += distance_between(box[i], box[(i + 1) % box.size()]);
+    }
+    const float area = polygon_area(box);
+    const float distance = perimeter > 1e-6f ? area * ratio / perimeter : 0.f;
+
+    std::vector<PointF> expanded;
+    expanded.reserve(box.size());
+    for (const auto& p : box) {
+        const float dx = p.x - cx;
+        const float dy = p.y - cy;
+        const float len = std::sqrt(dx * dx + dy * dy);
+        const float scale = len > 1e-6f ? (len + distance) / len : 1.f;
+        expanded.push_back({cx + dx * scale, cy + dy * scale});
+    }
+    return expanded;
 }
 
 static void axis_aligned_bounds(const RotatedTextBox& box, int image_width, int image_height, int& x1, int& y1,
@@ -340,7 +598,8 @@ static std::vector<RotatedTextBox> detect_text_boxes(ncnn::Net& det_net, const s
         return {};
     }
 
-    // DB 检测输出是文字概率图，这里提取连通区域并转换为旋转文本框。
+    // DB 检测输出是文字概率图。这里按 LiteOCR/PaddleOCR 的常规后处理：
+    // 二值连通区域 -> 最小外接旋转矩形 -> mask 平均分 -> unclip。
     const int map_width = out.w;
     const int map_height = out.h;
     std::vector<uint8_t> visited(static_cast<size_t>(map_width) * map_height, 0);
@@ -348,9 +607,9 @@ static std::vector<RotatedTextBox> detect_text_boxes(ncnn::Net& det_net, const s
 
     const float threshold = 0.3f;
     const int min_area = 6;
-    const float box_thresh = 0.5f;
-    const float unclip_ratio = 1.58f;
-    const float min_size = 3.f * scale;
+    const float box_thresh = 0.6f;
+    const float unclip_ratio = 1.5f;
+    const float min_size = 3.f;
 
     for (int y = 0; y < map_height; ++y) {
         const float* row = out.row(y);
@@ -359,9 +618,8 @@ static std::vector<RotatedTextBox> detect_text_boxes(ncnn::Net& det_net, const s
             if (visited[index] || row[x] < threshold)
                 continue;
 
-            float score_sum = 0.f;
             int count = 0;
-            std::vector<PointF> component_points;
+            std::vector<PointI> component_points;
             std::queue<std::pair<int, int>> pending;
             pending.push({x, y});
             visited[index] = 1;
@@ -370,10 +628,8 @@ static std::vector<RotatedTextBox> detect_text_boxes(ncnn::Net& det_net, const s
                 const auto [cx, cy] = pending.front();
                 pending.pop();
 
-                const float score = out.row(cy)[cx];
-                score_sum += score;
                 count++;
-                component_points.push_back({cx + 0.5f, cy + 0.5f});
+                component_points.push_back({cx, cy});
 
                 constexpr int dx[4] = {1, -1, 0, 0};
                 constexpr int dy[4] = {0, 0, 1, -1};
@@ -395,85 +651,27 @@ static std::vector<RotatedTextBox> detect_text_boxes(ncnn::Net& det_net, const s
             if (count < min_area)
                 continue;
 
-            const float component_score = score_sum / count;
+            const RotatedRect rect = min_area_rect(component_points);
+            if (std::min(rect.size.width, rect.size.height) < min_size)
+                continue;
+
+            const auto raw_array = order_box_points(rotated_rect_points(rect));
+            const std::vector<PointF> raw_box(raw_array.begin(), raw_array.end());
+            const float component_score = box_score(out, raw_box);
             if (component_score < box_thresh)
                 continue;
 
-            float mean_x = 0.f;
-            float mean_y = 0.f;
-            for (const auto& p : component_points) {
-                mean_x += p.x;
-                mean_y += p.y;
+            const auto expanded = unclip_box(raw_box, unclip_ratio);
+            std::vector<PointI> expanded_contour;
+            expanded_contour.reserve(expanded.size());
+            for (const auto& p : expanded) {
+                expanded_contour.push_back({static_cast<int>(std::round(p.x)), static_cast<int>(std::round(p.y))});
             }
-            mean_x /= component_points.size();
-            mean_y /= component_points.size();
-
-            float cov_xx = 0.f;
-            float cov_xy = 0.f;
-            float cov_yy = 0.f;
-            for (const auto& p : component_points) {
-                const float dx = p.x - mean_x;
-                const float dy = p.y - mean_y;
-                cov_xx += dx * dx;
-                cov_xy += dx * dy;
-                cov_yy += dy * dy;
-            }
-
-            const float angle = 0.5f * std::atan2(2.f * cov_xy, cov_xx - cov_yy);
-            PointF major{std::cos(angle), std::sin(angle)};
-            if (major.x < 0.f) {
-                major.x = -major.x;
-                major.y = -major.y;
-            }
-            PointF minor{-major.y, major.x};
-            if (minor.y < 0.f) {
-                minor.x = -minor.x;
-                minor.y = -minor.y;
-            }
-
-            float min_major = std::numeric_limits<float>::max();
-            float max_major = std::numeric_limits<float>::lowest();
-            float min_minor = std::numeric_limits<float>::max();
-            float max_minor = std::numeric_limits<float>::lowest();
-            for (const auto& p : component_points) {
-                const float px = p.x - mean_x;
-                const float py = p.y - mean_y;
-                const float major_projection = px * major.x + py * major.y;
-                const float minor_projection = px * minor.x + py * minor.y;
-                min_major = std::min(min_major, major_projection);
-                max_major = std::max(max_major, major_projection);
-                min_minor = std::min(min_minor, minor_projection);
-                max_minor = std::max(max_minor, minor_projection);
-            }
-
-            float text_width = std::max(1.f, max_major - min_major + 1.f);
-            float text_height = std::max(1.f, max_minor - min_minor + 1.f);
-            if (std::max(text_width, text_height) < min_size)
+            const RotatedRect expanded_rect = min_area_rect(expanded_contour);
+            if (std::min(expanded_rect.size.width, expanded_rect.size.height) < min_size + 2.f)
                 continue;
 
-            const float center_major = (min_major + max_major) * 0.5f;
-            const float center_minor = (min_minor + max_minor) * 0.5f;
-            PointF center{
-                mean_x + major.x * center_major + minor.x * center_minor,
-                mean_y + major.y * center_major + minor.y * center_minor,
-            };
-
-            const std::array<PointF, 4> raw_box{
-                PointF{center.x - major.x * text_width * 0.5f - minor.x * text_height * 0.5f,
-                       center.y - major.y * text_width * 0.5f - minor.y * text_height * 0.5f},
-                PointF{center.x + major.x * text_width * 0.5f - minor.x * text_height * 0.5f,
-                       center.y + major.y * text_width * 0.5f - minor.y * text_height * 0.5f},
-                PointF{center.x + major.x * text_width * 0.5f + minor.x * text_height * 0.5f,
-                       center.y + major.y * text_width * 0.5f + minor.y * text_height * 0.5f},
-                PointF{center.x - major.x * text_width * 0.5f + minor.x * text_height * 0.5f,
-                       center.y - major.y * text_width * 0.5f + minor.y * text_height * 0.5f},
-            };
-            const float perimeter = 2.f * (text_width + text_height);
-            const float unclip_distance = perimeter > 1e-6f ? polygon_area(raw_box) * unclip_ratio / perimeter : 0.f;
-            text_width += unclip_distance * 2.f;
-            text_height += unclip_distance * 2.f;
-            const float half_width = text_width * 0.5f;
-            const float half_height = text_height * 0.5f;
+            const auto mapped_box = order_box_points(rotated_rect_points(expanded_rect));
 
             const float sx = static_cast<float>(in_pad.w) / map_width;
             const float sy = static_cast<float>(in_pad.h) / map_height;
@@ -485,31 +683,20 @@ static std::vector<RotatedTextBox> detect_text_boxes(ncnn::Net& det_net, const s
             };
 
             RotatedTextBox box;
-            box.corners[0] =
-                to_original({center.x - major.x * half_width - minor.x * half_height,
-                             center.y - major.y * half_width - minor.y * half_height});
-            box.corners[1] =
-                to_original({center.x + major.x * half_width - minor.x * half_height,
-                             center.y + major.y * half_width - minor.y * half_height});
-            box.corners[2] =
-                to_original({center.x + major.x * half_width + minor.x * half_height,
-                             center.y + major.y * half_width + minor.y * half_height});
-            box.corners[3] =
-                to_original({center.x - major.x * half_width + minor.x * half_height,
-                             center.y - major.y * half_width + minor.y * half_height});
+            for (size_t i = 0; i < box.corners.size(); ++i) {
+                box.corners[i] = to_original(mapped_box[i]);
+            }
             box.score = component_score;
             boxes.push_back(box);
         }
     }
 
     std::sort(boxes.begin(), boxes.end(), [](const RotatedTextBox& a, const RotatedTextBox& b) {
-        const float ay = (a.corners[0].y + a.corners[1].y + a.corners[2].y + a.corners[3].y) * 0.25f;
-        const float by = (b.corners[0].y + b.corners[1].y + b.corners[2].y + b.corners[3].y) * 0.25f;
-        if (std::abs(ay - by) > 10)
-            return ay < by;
-        const float ax = (a.corners[0].x + a.corners[1].x + a.corners[2].x + a.corners[3].x) * 0.25f;
-        const float bx = (b.corners[0].x + b.corners[1].x + b.corners[2].x + b.corners[3].x) * 0.25f;
-        return ax < bx;
+        const auto a_points = order_box_points(a.corners);
+        const auto b_points = order_box_points(b.corners);
+        if (std::abs(a_points[0].y - b_points[0].y) > 10.f)
+            return a_points[0].y < b_points[0].y;
+        return a_points[0].x < b_points[0].x;
     });
 
     return boxes;
@@ -655,6 +842,7 @@ static bool recognize_crop_with_classifier(ncnn::Net& rec_net, ncnn::Net* cls_ne
 
 struct NcnnOcrEngine::Impl {
     NcnnOcrModelPaths model_paths;
+    NcnnOcrOptions options;
     std::vector<std::string> character_dict;
     bool initialized = false;
     bool use_vulkan = false;
@@ -680,9 +868,16 @@ const char* NcnnOcrEngine::version() {
 }
 
 bool NcnnOcrEngine::init(const NcnnOcrModelPaths& model_paths, bool use_vulkan) {
+    NcnnOcrOptions options;
+    options.use_vulkan = use_vulkan;
+    options.gpu_device_id = use_vulkan ? 0 : -1;
+    return init(model_paths, options);
+}
+
+bool NcnnOcrEngine::init(const NcnnOcrModelPaths& model_paths, const NcnnOcrOptions& options) {
 #ifndef OCR_HAS_NCNN
     (void)model_paths;
-    (void)use_vulkan;
+    (void)options;
     std::cerr << "[NcnnOcrEngine] ncnn support is not enabled in this build" << std::endl;
     return false;
 #else
@@ -705,7 +900,12 @@ bool NcnnOcrEngine::init(const NcnnOcrModelPaths& model_paths, bool use_vulkan) 
         return false;
     }
 
-    const fs::path dict_path = fs::path(model_paths.rec_param).parent_path() / "ppocrv5_dict.txt";
+    const fs::path dict_path = model_paths.dict_path.empty()
+        ? fs::path(model_paths.rec_param).parent_path() / "PP-OCRv5_vocab.txt"
+        : fs::path(model_paths.dict_path);
+    if (!require_file(dict_path.string(), "dict_path")) {
+        return false;
+    }
     impl_->character_dict = load_character_dict(dict_path);
     if (impl_->character_dict.empty()) {
         std::cerr << "[NcnnOcrEngine] Character dict is empty: " << dict_path.string() << std::endl;
@@ -716,9 +916,58 @@ bool NcnnOcrEngine::init(const NcnnOcrModelPaths& model_paths, bool use_vulkan) 
     impl_->rec_net.clear();
     impl_->cls_net.clear();
 
-    impl_->det_net.opt.use_vulkan_compute = use_vulkan;
-    impl_->rec_net.opt.use_vulkan_compute = use_vulkan;
-    impl_->cls_net.opt.use_vulkan_compute = use_vulkan;
+    // det/rec/cls 共用同一套推理选项，Vulkan 设备只探测一次，避免重复告警。
+    bool enable_vulkan = false;
+    int vulkan_device_id = -1;
+#if NCNN_VULKAN
+    if (options.use_vulkan || options.gpu_device_id >= 0) {
+        const int gpu_count = ncnn::get_gpu_count();
+        if (gpu_count > 0) {
+            const int requested_device = options.gpu_device_id >= 0 ? options.gpu_device_id : 0;
+            if (requested_device < gpu_count) {
+                enable_vulkan = true;
+                vulkan_device_id = requested_device;
+            } else {
+                std::cerr << "[NcnnOcrEngine] GPU device " << requested_device
+                          << " is unavailable; falling back to CPU" << std::endl;
+            }
+        } else {
+            std::cerr << "[NcnnOcrEngine] Vulkan requested but no GPU device is available; falling back to CPU"
+                      << std::endl;
+        }
+    }
+#else
+    if (options.use_vulkan || options.gpu_device_id >= 0) {
+        std::cerr << "[NcnnOcrEngine] Vulkan requested but this ncnn build has no Vulkan support; falling back to CPU"
+                  << std::endl;
+    }
+#endif
+
+    auto apply_options = [&options, enable_vulkan, vulkan_device_id](ncnn::Net& net) {
+        net.opt.num_threads = std::max(1, options.num_threads);
+        net.opt.use_fp16_arithmetic = options.use_fp16;
+        net.opt.use_fp16_storage = options.use_fp16;
+        net.opt.use_fp16_packed = options.use_fp16;
+        net.opt.use_int8_arithmetic = options.use_int8;
+        net.opt.use_int8_storage = options.use_int8;
+        net.opt.use_int8_packed = options.use_int8;
+        if (options.use_bf16) {
+            net.opt.use_fp16_arithmetic = false;
+            net.opt.use_fp16_storage = false;
+            net.opt.use_fp16_packed = false;
+            net.opt.use_bf16_storage = true;
+            net.opt.use_bf16_packed = true;
+        }
+#if NCNN_VULKAN
+        if (enable_vulkan) {
+            net.set_vulkan_device(vulkan_device_id);
+            net.opt.use_vulkan_compute = true;
+        }
+#endif
+    };
+    apply_options(impl_->det_net);
+    apply_options(impl_->rec_net);
+    apply_options(impl_->cls_net);
 
     if (impl_->det_net.load_param(model_paths.det_param.c_str()) != 0 ||
         impl_->det_net.load_model(model_paths.det_bin.c_str()) != 0) {
@@ -748,14 +997,21 @@ bool NcnnOcrEngine::init(const NcnnOcrModelPaths& model_paths, bool use_vulkan) 
     }
 
     impl_->model_paths = model_paths;
-    impl_->use_vulkan = use_vulkan;
+    impl_->options = options;
+    impl_->use_vulkan = impl_->det_net.opt.use_vulkan_compute;
     impl_->initialized = true;
 
     std::cout << "[NcnnOcrEngine] Initialized"
               << " det=" << model_paths.det_param
               << " rec=" << model_paths.rec_param
+              << " dict=" << dict_path.string()
               << " cls=" << (impl_->cls_initialized ? model_paths.cls_param : "disabled")
-              << " use_vulkan=" << (use_vulkan ? "true" : "false")
+              << " threads=" << std::max(1, options.num_threads)
+              << " gpu_device=" << options.gpu_device_id
+              << " fp16=" << (options.use_fp16 ? "true" : "false")
+              << " int8=" << (options.use_int8 ? "true" : "false")
+              << " bf16=" << (options.use_bf16 ? "true" : "false")
+              << " use_vulkan=" << (impl_->use_vulkan ? "true" : "false")
               << std::endl;
     return true;
 #endif
@@ -841,24 +1097,6 @@ OcrResponse NcnnOcrEngine::recognize_with_profile(const uint8_t* image, int widt
         result.text = text;
         result.confidence = confidence;
         response.results.push_back(std::move(result));
-    }
-
-    if (response.results.empty()) {
-        std::string text;
-        float confidence = 0.f;
-        const auto rec_start = Clock::now();
-        if (recognize_crop_with_classifier(impl_->rec_net, cls_net, impl_->character_dict, bgr.data(), width, height,
-                                           force_180, text, confidence)) {
-            OcrResult result;
-            result.x1 = 0;
-            result.y1 = 0;
-            result.x2 = width;
-            result.y2 = height;
-            result.text = text;
-            result.confidence = confidence;
-            response.results.push_back(std::move(result));
-        }
-        response.profile.rec_ms += elapsed_ms(rec_start, Clock::now());
     }
 
     response.profile.total_ms = elapsed_ms(total_start, Clock::now());

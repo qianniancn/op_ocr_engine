@@ -1,161 +1,239 @@
 # op_ocr_engine
 
-`op_ocr_engine` 是一个本地 OCR HTTP 服务。当前推荐使用 `ncnn + PP-OCRv5`，用于窗口截图识别、返回文字 bbox，并给 `op` 主项目做找字和点击坐标。
+`op_ocr_engine` 是给 `op/libop` 用的本地 OCR HTTP 服务。主程序是 C++ 版 `ocr_server.exe`，用 ncnn 跑 PaddleOCR/PP-OCR 模型，负责从窗口截图里识别文字并返回文字框。
 
-服务接口保持简单：
+仓库只放代码、脚本和文档。OCR 模型文件比较大，不再提交到 GitHub，部署或本地调试时单独下载。
 
-- `GET /health`
-- `GET /api/v1/version`
-- `POST /api/v1/ocr`
+## 服务约定
 
-## 1. 目录约定
+`libop` 通过 `SetOcrEngine` 选择 OCR 后端。现在保留三个名字：
 
-推荐本地目录结构：
+```text
+tesseract      -> http://127.0.0.1:8080/api/v1/ocr
+paddle         -> http://127.0.0.1:8081/api/v1/ocr
+paddle_ncnn    -> http://127.0.0.1:8082/api/v1/ocr
+```
+
+`paddle_ncnn` 是本项目的主服务。这个名字的意思是：模型来自 PaddleOCR/PP-OCR，推理运行时是 ncnn。
+
+`libop` 里通常这样配置：
+
+```text
+SetOcrEngine("paddle_ncnn", "", "")
+```
+
+如果想完全绕开后端名，也可以直接传 URL：
+
+```text
+SetOcrEngine("", "", "--url=http://127.0.0.1:8082/api/v1/ocr --timeout=3000")
+```
+
+端口分工不要混用：
+
+```text
+8080  Tesseract HTTP 服务
+8081  py_paddle_server，Python PaddleOCR 服务
+8082  ocr_server.exe，C++ ncnn 服务
+```
+
+## 本地目录
+
+建议把运行时文件放在仓库内的本地目录里，但不要提交这些目录：
 
 ```text
 op_ocr_engine/
-  3rd_party/
-    ncnn/
-      x64/
-        include/
-        lib/
-      x86/
-        include/
-        lib/
-      arm64/
-        include/
-        lib/
-  models/
-    PP_OCRv5_mobile_det.param
-    PP_OCRv5_mobile_det.bin
-    PP_OCRv5_mobile_rec.param
-    PP_OCRv5_mobile_rec.bin
-    PP_LCNet_x0_25_textline_ori.param
-    PP_LCNet_x0_25_textline_ori.bin
-    ppocrv5_dict.txt
-  build.py
-  CMakeLists.txt
+  3rd_party/           # ncnn 预编译包，build.py 可自动准备
+  build-vs2026-x64/    # 构建产物
+  images/              # 本地测试图片
+  models/              # OCR 模型，本机下载，不提交 GitHub
+  py_paddle_server/
   src/
   tests/
+  build.py
+  CMakeLists.txt
 ```
 
-这些目录不会提交到 Git：
-
-- `3rd_party/`：本机第三方依赖。
-- `build-vs*/`：CMake/Visual Studio 构建产物。
-- `images/`：本地测试图片。
-
-## 2. 第三方依赖
-
-### 2.1 ncnn
-
-下载地址：
-
-- `https://github.com/Tencent/ncnn/releases`
-
-Windows + VS2026/VS2022 推荐下载 VS2022 包：
-
-```text
-ncnn-<version>-windows-vs2022.zip
-```
-
-如果只做本地静态链接，优先使用非 `shared` 包。`shared` 包会依赖额外 DLL，交付时需要一起带上。
-
-解压后把对应架构内容放到：
-
-```text
-op_ocr_engine/3rd_party/ncnn/x64
-op_ocr_engine/3rd_party/ncnn/x86
-op_ocr_engine/3rd_party/ncnn/arm64
-```
-
-CMake 默认读取：
-
-```cmake
-NCNN_ROOT = <repo>/3rd_party/ncnn
-```
-
-然后根据当前编译架构自动查找：
-
-```text
-3rd_party/ncnn/x64/lib/cmake/ncnn/ncnnConfig.cmake
-3rd_party/ncnn/x86/lib/cmake/ncnn/ncnnConfig.cmake
-3rd_party/ncnn/arm64/lib/cmake/ncnn/ncnnConfig.cmake
-```
-
-如果放在其他位置，可以构建时指定：
+启动服务时建议显式传模型目录：
 
 ```powershell
-python build.py --ncnn-root E:\path\to\ncnn
+--model-dir models
 ```
 
-### 2.2 C++ HTTP/JSON 依赖
+这样不依赖当前工作目录，也不依赖程序里保留的默认路径。
 
-CMake 使用 `FetchContent` 拉取：
+## 模型准备
 
-- `cpp-httplib`
-- `nlohmann/json`
+模型下载：
 
-首次配置时需要能访问网络，或者提前准备好 CMake 的 `_deps` 缓存。
+[https://mirrors.sdu.edu.cn/ncnn_modelzoo/liteocr/](https://mirrors.sdu.edu.cn/ncnn_modelzoo/liteocr/)
 
-### 2.3 Tesseract 可选依赖
+也可以加 QQ 群 `743710486` 获取模型文件。
 
-Tesseract 现在是可选 backend。默认 `build.py` 会关闭 Tesseract，只构建 ncnn OCR 服务。
+下载后放到本地 `models/` 目录。默认模型是 `small`。
 
-如需 Tesseract：
+INT8 是量化模型，文件名里会带 `_int8`。它通常更省内存，CPU 推理也可能更快；代价是识别结果可能有轻微损失，尤其是小字、模糊字和低对比度文字。默认先用普通模型，只有在需要压速度或资源占用时，再用 `--int8` 做对比。
+
+PP-OCRv6 `tiny` 适合只关心速度的场景，比如快速扫按钮、菜单、标题这类界面文字。它启动和推理都比较轻，但遇到小字号、低对比度或密集文字时，稳定性不如 `small`。
+
+`tiny` 必需文件：
+
+```text
+models/
+  PP-OCRv6_tiny_det.param
+  PP-OCRv6_tiny_det.bin
+  PP-OCRv6_tiny_rec.param
+  PP-OCRv6_tiny_rec.bin
+  PP-OCRv6_vocab_tiny.txt
+```
+
+`tiny` 可选 INT8 文件，使用 `--int8` 时需要：
+
+```text
+models/
+  PP-OCRv6_tiny_det_int8.param
+  PP-OCRv6_tiny_det_int8.bin
+  PP-OCRv6_tiny_rec_int8.param
+  PP-OCRv6_tiny_rec_int8.bin
+  PP-OCRv6_vocab_tiny.txt
+```
+
+PP-OCRv6 `small` 是默认选择，适合 `libop` 日常找字、点按钮、读窗口文本。它比 `tiny` 稳一些，又不会像 `medium` 那样明显增加耗时，普通使用先选它。
+
+`small` 必需文件：
+
+```text
+models/
+  PP-OCRv6_small_det.param
+  PP-OCRv6_small_det.bin
+  PP-OCRv6_small_rec.param
+  PP-OCRv6_small_rec.bin
+  PP-OCRv6_vocab.txt
+```
+
+`small` 可选 INT8 文件，使用 `--int8` 时需要：
+
+```text
+models/
+  PP-OCRv6_small_det_int8.param
+  PP-OCRv6_small_det_int8.bin
+  PP-OCRv6_small_rec_int8.param
+  PP-OCRv6_small_rec_int8.bin
+  PP-OCRv6_vocab.txt
+```
+
+PP-OCRv6 `medium` 适合更看重识别质量的截图，比如小字比较多、背景复杂、文字挤在一起的页面。代价是模型更大，推理会比 `small` 慢一些。
+
+`medium` 必需文件：
+
+```text
+models/
+  PP-OCRv6_medium_det.param
+  PP-OCRv6_medium_det.bin
+  PP-OCRv6_medium_rec.param
+  PP-OCRv6_medium_rec.bin
+  PP-OCRv6_vocab.txt
+```
+
+`medium` 可选 INT8 文件，使用 `--int8` 时需要：
+
+```text
+models/
+  PP-OCRv6_medium_det_int8.param
+  PP-OCRv6_medium_det_int8.bin
+  PP-OCRv6_medium_rec_int8.param
+  PP-OCRv6_medium_rec_int8.bin
+  PP-OCRv6_vocab.txt
+```
+
+方向分类是通用可选项，用来处理倒置文字。常规窗口截图一般可以不放；如果遇到文字方向不稳定，再加这组模型。
+
+普通模式可放：
+
+```text
+models/
+  PP-LCNet_x1_0_textline_ori.param
+  PP-LCNet_x1_0_textline_ori.bin
+```
+
+INT8 模式可放：
+
+```text
+models/
+  PP-LCNet_x1_0_textline_ori_int8.param
+  PP-LCNet_x1_0_textline_ori_int8.bin
+```
+
+表格结构识别不是当前 `ocr_server.exe` 的必需能力。只做文字识别、找字和点击坐标时，不需要下面这些文件。
+
+如果以后要把截图里的表格还原成 HTML 结构，才需要表格模型：
+
+```text
+models/
+  PP-StructrureV2_SLANet_plus_cnn.param
+  PP-StructrureV2_SLANet_plus_cnn.bin
+  PP-StructrureV2_SLANet_plus_slahead.param
+  PP-StructrureV2_SLANet_plus_slahead.bin
+  table_structure_dict_ch.txt
+```
+
+如果只是识别表格单元格里的文字，仍然用 `tiny`、`small` 或 `medium`，不需要表格结构模型。
+
+PP-OCRv5 主要用于和历史模型结果做对比，或者在需要复现 v5 行为时使用。新场景优先用 PP-OCRv6。
+
+PP-OCRv5 不使用 `--quality`，需要显式指定版本和类型：
 
 ```powershell
-python build.py --with-tesseract
+ocr_server.exe --model-dir models --model-version v5 --model-type mobile
+ocr_server.exe --model-dir models --model-version v5 --model-type server
 ```
 
-这时需要本机能被 CMake 找到 `Tesseract::libtesseract`。
-
-## 3. OCR 模型
-
-当前 ncnn backend 默认使用 PP-OCRv5 mobile 模型：
+PP-OCRv5 `mobile` 模型小，适合做兼容性对比或轻量回归：
 
 ```text
-PP_OCRv5_mobile_det.param
-PP_OCRv5_mobile_det.bin
-PP_OCRv5_mobile_rec.param
-PP_OCRv5_mobile_rec.bin
-PP_LCNet_x0_25_textline_ori.param
-PP_LCNet_x0_25_textline_ori.bin
-ppocrv5_dict.txt
+models/
+  PP-OCRv5_mobile_det.param
+  PP-OCRv5_mobile_det.bin
+  PP-OCRv5_mobile_rec.param
+  PP-OCRv5_mobile_rec.bin
+  PP-OCRv5_vocab.txt
 ```
 
-放置路径：
+PP-OCRv5 `server` 模型更大，适合对比 v5 的高精度版本：
 
 ```text
-op_ocr_engine/models/
+models/
+  PP-OCRv5_server_det.param
+  PP-OCRv5_server_det.bin
+  PP-OCRv5_server_rec.param
+  PP-OCRv5_server_rec.bin
+  PP-OCRv5_vocab.txt
 ```
 
-启动服务时默认按 `--model-dir models` 查找。
+注意：`build.py` 自动下载的是 ncnn 运行库，不是 OCR 模型。模型需要按上面的地址单独准备。
 
-模型来源可以是：
+## 构建
 
-- 自己从 PaddleOCR 官方模型转换为 ONNX，再转换为 ncnn。
-- 使用已转换好的 PP-OCRv5 ncnn 模型。
-
-仓库包含一套默认可用的 mobile 模型，便于拉取后直接构建和启动。替换模型时保持同名文件放在 `models/` 目录即可。
-
-## 4. 构建
-
-推荐使用仓库里的构建脚本：
+Windows 下直接用构建脚本：
 
 ```powershell
 python build.py
 ```
 
-默认行为：
+默认构建 C++ ncnn 服务：
 
 ```text
-generator: 当前机器可用的 VS2026/VS2022
-arch: x64
-type: Release
-target: ocr_server
-Tesseract: OFF
-Tests: OFF
+Generator  自动检测 VS2026 / VS2022
+Arch       x64
+Type       Release
+Target     ocr_server
+Tesseract  OFF
+Tests      OFF
+```
+
+`build.py` 会检查 `3rd_party/ncnn`。如果缺少 ncnn，会下载默认的 Windows VS2022 预编译包：
+
+```text
+ncnn-20260526-windows-vs2022.zip
 ```
 
 常用命令：
@@ -164,55 +242,97 @@ Tests: OFF
 python build.py -g vs2026 -a x64 -t Release
 python build.py -g vs2022 -a x64 -t Release
 python build.py -g vs2026 -a x64 -t Release --clean
-python build.py -g vs2026 -a x64 -t Release --target ocr_server
+python build.py --no-ncnn-download
+python build.py --ncnn-root E:\path\to\ncnn
 ```
 
-构建产物：
+构建完成后，常用产物路径是：
 
 ```text
-build-vs2026-x64/Release/ocr_server.exe
-build-vs2022-x64/Release/ocr_server.exe
+build-vs2026-x64\Release\ocr_server.exe
+build-vs2022-x64\Release\ocr_server.exe
 ```
 
-也可以直接用 CMake：
+Tesseract 是单独的 OCR 后端，默认不参与构建。需要时再打开：
 
 ```powershell
-cmake -S . -B build-vs2026-x64 -G "Visual Studio 18 2026" -A x64 -DNCNN_ROOT=3rd_party/ncnn -DBUILD_TESSERACT_SERVER=OFF -DBUILD_TESTING=OFF
-cmake --build build-vs2026-x64 --config Release --target ocr_server
+python build.py --with-tesseract
 ```
 
-## 5. 启动服务
+这要求本机 CMake 能找到 `Tesseract::libtesseract`。
 
-ncnn mobile：
+## 启动
+
+日常启动默认使用 `small`：
 
 ```powershell
-build-vs2026-x64\Release\ocr_server.exe --backend ncnn --model-dir models --model-type mobile --host 127.0.0.1 --port 8081
+ocr_server.exe --model-dir models
 ```
 
-ncnn server 模型，如果已准备对应模型文件：
+也可以显式指定 PP-OCRv6 模型规格：
 
 ```powershell
-build-vs2026-x64\Release\ocr_server.exe --backend ncnn --model-dir models --model-type server --host 127.0.0.1 --port 8081
+ocr_server.exe --model-dir models --model-type tiny
+ocr_server.exe --model-dir models --model-type small
+ocr_server.exe --model-dir models --model-type medium
 ```
 
-参数说明：
-
-- `--backend`：`auto` / `ncnn` / `tesseract`，默认 `auto`。
-- `--model-dir`：ncnn 模型目录，默认 `models`。
-- `--model-type`：`mobile` 或 `server`，默认 `mobile`。
-- `--use-vulkan`：启用 ncnn Vulkan，需 ncnn 包和运行环境支持。
-- `--host`：监听地址，默认 `0.0.0.0`。
-- `--port`：监听端口，默认 `8080`。
-
-Tesseract backend：
+PP-OCRv5 用的是 `mobile` 和 `server` 两个规格，启动时写清楚版本：
 
 ```powershell
-ocr_server.exe --backend tesseract --datapath tessdata --lang chi_sim --host 127.0.0.1 --port 8081
+ocr_server.exe --model-dir models --model-version v5 --model-type mobile
+ocr_server.exe --model-dir models --model-version v5 --model-type server
 ```
 
-## 6. HTTP 协议
+GPU 模式：
 
-### 6.1 健康检查
+```powershell
+ocr_server.exe --model-dir models --model-type small --device gpu
+```
+
+INT8 模式：
+
+```powershell
+ocr_server.exe --model-dir models --model-type small --int8
+```
+
+默认监听：
+
+```text
+http://127.0.0.1:8082
+```
+
+常用参数：
+
+```text
+--model-dir      模型目录，建议显式传 models
+--model-version  模型版本，v6 或 v5，默认 v6
+--model-type     v6 用 tiny / small / medium，默认 small；v5 用 mobile / server
+--int8           加载 *_int8 模型，并打开 ncnn INT8 推理
+--device         cpu / gpu，默认 cpu
+--host           默认 127.0.0.1
+--port           默认 8082
+```
+
+`--quality fast|balanced|accurate` 仍然可用，对应 `tiny|small|medium`。新配置优先写 `--model-type`。
+
+开发调试参数可以看：
+
+```powershell
+ocr_server.exe --help-advanced
+```
+
+## HTTP 接口
+
+服务提供三个接口：
+
+```text
+GET  /health
+GET  /api/v1/version
+POST /api/v1/ocr
+```
+
+健康检查：
 
 ```text
 GET /health
@@ -224,19 +344,7 @@ GET /health
 { "status": "ok" }
 ```
 
-### 6.2 版本信息
-
-```text
-GET /api/v1/version
-```
-
-响应示例：
-
-```json
-{ "version": "ncnn-ocr-service 1.0" }
-```
-
-### 6.3 OCR 识别
+OCR 请求使用 JSON，传的是原始像素字节的 Base64，不是 PNG/JPG 文件内容。
 
 ```text
 POST /api/v1/ocr
@@ -245,12 +353,12 @@ Content-Type: application/json
 
 请求字段：
 
-- `image`：原始像素字节的 Base64 字符串。
-- `width`：图像宽度。
-- `height`：图像高度。
-- `bpp`：每像素字节数，支持 `1`、`3`、`4`。
-
-注意：接口接收的是原始像素字节，不是 PNG/JPG 文件本身。
+```text
+image   原始像素字节的 Base64 字符串
+width   图像宽度
+height  图像高度
+bpp     每像素字节数，支持 1 / 3 / 4
+```
 
 成功响应示例：
 
@@ -273,20 +381,20 @@ Content-Type: application/json
 }
 ```
 
-`bbox` 是图像坐标中的外接矩形：
+`bbox` 是文字外接矩形：
 
 ```text
 [x1, y1, x2, y2]
 ```
 
-上层如果需要点击文字，通常使用中心点：
+上层要点击文字时，一般取中心点：
 
 ```text
 cx = (x1 + x2) / 2
 cy = (y1 + y2) / 2
 ```
 
-## 7. Python 调用示例
+## Python 调用示例
 
 ```python
 import base64
@@ -303,7 +411,7 @@ payload = {
 }
 
 request = urllib.request.Request(
-    "http://127.0.0.1:8081/api/v1/ocr",
+    "http://127.0.0.1:8082/api/v1/ocr",
     data=json.dumps(payload).encode("utf-8"),
     headers={"Content-Type": "application/json"},
     method="POST",
@@ -313,35 +421,51 @@ with urllib.request.urlopen(request, timeout=30) as response:
     print(response.read().decode("utf-8"))
 ```
 
-## 8. 测试和可视化工具
+## 测试工具
 
-基准测试：
+接口压测：
 
 ```powershell
-python tests\benchmark_ocr_server.py --url http://127.0.0.1:8081/api/v1/ocr --image-dir images --repeat 3 --concurrency 1
+python tests\benchmark_ocr_server.py --url http://127.0.0.1:8082/api/v1/ocr --image-dir images --repeat 3 --concurrency 1
+```
+
+不同模型档位对比：
+
+```powershell
+python tests\benchmark_ncnn_models.py --model-dir models --image-dir images --repeat 3 --csv build-vs2026-x64\ncnn_model_benchmark.csv
+```
+
+GPU 对比：
+
+```powershell
+python tests\benchmark_ncnn_models.py --model-dir models --use-vulkan --gpu-device 0 --threads 4
+```
+
+INT8 对比：
+
+```powershell
+python tests\benchmark_ncnn_models.py --model-dir models --int8
 ```
 
 bbox 可视化：
 
 ```powershell
-python tests\visualize_ocr_bboxes.py --url http://127.0.0.1:8081/api/v1/ocr --image-dir images --output-dir build-vs2026-x64\ocr_bbox_visuals --show-text
+python tests\visualize_ocr_bboxes.py --url http://127.0.0.1:8082/api/v1/ocr --image-dir images --output-dir build-vs2026-x64\ocr_bbox_visuals --show-text
 ```
 
-测试脚本只依赖 HTTP 接口，不参与 `ocr_server.exe` 编译。
+## Python PaddleOCR 服务
 
-## 9. PaddleOCR Python 服务
+`py_paddle_server/` 是保留下来的 Python PaddleOCR 服务，端口固定为 `8081`。它和 C++ 服务使用同一套 HTTP 协议，主要用于精度对比和回退验证。
 
-项目还保留了一个基于 FastAPI 的 PaddleOCR HTTP 服务：
-
-```text
-py_paddle_server/app.py
-```
-
-启动示例：
+启动：
 
 ```powershell
 pip install -r py_paddle_server\requirements.txt
-uvicorn py_paddle_server.app:app --host 0.0.0.0 --port 8082
+uvicorn py_paddle_server.app:app --host 0.0.0.0 --port 8081
 ```
 
-它的 HTTP 协议与 C++ 服务保持兼容，可用于和 ncnn 服务做精度对比。
+`libop` 切到 Python PaddleOCR：
+
+```text
+SetOcrEngine("paddle", "", "")
+```

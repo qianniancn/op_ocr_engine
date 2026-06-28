@@ -10,10 +10,18 @@ Examples:
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
 
 GENERATORS = {
@@ -24,6 +32,12 @@ GENERATORS = {
 BUILD_TYPES = ("Debug", "Release", "RelWithDebInfo")
 ARCHITECTURES = ("x86", "x64")
 ARCH_TO_VS = {"x86": "Win32", "x64": "x64"}
+NCNN_PACKAGE_ARCHITECTURES = ("x86", "x64", "arm64")
+DEFAULT_NCNN_VERSION = "20260526"
+DEFAULT_NCNN_URL = (
+    "https://github.com/Tencent/ncnn/releases/download/20260526/"
+    "ncnn-20260526-windows-vs2022.zip"
+)
 
 
 def find_vswhere() -> Path | None:
@@ -134,6 +148,168 @@ def resolve_path(project_dir: Path, value: str) -> Path:
     return path if path.is_absolute() else (project_dir / path).resolve()
 
 
+def ncnn_config_path(ncnn_root: Path, arch: str) -> Path:
+    return ncnn_root / arch / "lib" / "cmake" / "ncnn" / "ncnnConfig.cmake"
+
+
+def ncnn_config_version_path(ncnn_root: Path, arch: str) -> Path:
+    return ncnn_root / arch / "lib" / "cmake" / "ncnn" / "ncnnConfigVersion.cmake"
+
+
+def parse_cmake_set_values(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+
+    pattern = re.compile(r"^\s*set\(\s*([A-Za-z0-9_]+)\s+\"?([^\"\)]+)\"?\s*\)")
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        match = pattern.match(line)
+        if match:
+            values[match.group(1)] = match.group(2).strip()
+    return values
+
+
+def detect_ncnn_info(ncnn_root: Path, arch: str) -> dict[str, str]:
+    config_values = parse_cmake_set_values(ncnn_config_path(ncnn_root, arch))
+    version_values = parse_cmake_set_values(ncnn_config_version_path(ncnn_root, arch))
+    shared = config_values.get("NCNN_SHARED_LIB", "unknown")
+    return {
+        "version": config_values.get("NCNN_VERSION")
+        or version_values.get("PACKAGE_VERSION")
+        or DEFAULT_NCNN_VERSION,
+        "vulkan": config_values.get("NCNN_VULKAN", "unknown"),
+        "shared": shared,
+        "linkage": "shared" if shared == "ON" else "static" if shared == "OFF" else "unknown",
+    }
+
+
+def package_filename_from_url(url: str) -> str:
+    filename = url.rstrip("/").rsplit("/", 1)[-1]
+    return filename or f"ncnn-{DEFAULT_NCNN_VERSION}-windows-vs2022.zip"
+
+
+def download_file(url: str, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_file():
+        print(f"[INFO] Using cached ncnn package: {destination}")
+        return
+
+    temp_destination = destination.with_suffix(destination.suffix + ".tmp")
+    if temp_destination.exists():
+        temp_destination.unlink()
+
+    print(f"[INFO] Downloading ncnn package: {url}")
+    progress = {"next_percent": 0}
+
+    def report_progress(block_count: int, block_size: int, total_size: int) -> None:
+        if total_size <= 0:
+            return
+        downloaded = min(block_count * block_size, total_size)
+        percent = int(downloaded * 100 / total_size)
+        if percent >= progress["next_percent"]:
+            print(f"[INFO] ncnn download {percent}%")
+            progress["next_percent"] += 10
+
+    try:
+        urllib.request.urlretrieve(url, temp_destination, reporthook=report_progress)
+        temp_destination.replace(destination)
+    except Exception as exc:
+        if temp_destination.exists():
+            temp_destination.unlink()
+        raise RuntimeError(f"Failed to download ncnn package: {exc}") from exc
+
+
+def safe_extract_zip(archive_path: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    destination_root = destination.resolve()
+
+    with zipfile.ZipFile(archive_path) as archive:
+        for member in archive.infolist():
+            target = (destination_root / member.filename).resolve()
+            if target != destination_root and destination_root not in target.parents:
+                raise RuntimeError(f"Unsafe path in ncnn archive: {member.filename}")
+        archive.extractall(destination_root)
+
+
+def find_extracted_ncnn_root(extract_dir: Path) -> Path | None:
+    for config in extract_dir.rglob("ncnnConfig.cmake"):
+        try:
+            arch_dir = config.parents[3]
+            package_root = config.parents[4]
+        except IndexError:
+            continue
+
+        if (
+            arch_dir.name in NCNN_PACKAGE_ARCHITECTURES
+            and config.parent.name == "ncnn"
+            and config.parent.parent.name == "cmake"
+            and config.parent.parent.parent.name == "lib"
+        ):
+            return package_root
+    return None
+
+
+def install_ncnn_package(package_root: Path, ncnn_root: Path) -> None:
+    ncnn_root.mkdir(parents=True, exist_ok=True)
+    installed_arches: list[str] = []
+
+    for arch in NCNN_PACKAGE_ARCHITECTURES:
+        source = package_root / arch
+        if not source.is_dir():
+            continue
+        target = ncnn_root / arch
+        print(f"[INFO] Installing ncnn {arch}: {target}")
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source, target)
+        installed_arches.append(arch)
+
+    if not installed_arches:
+        raise RuntimeError(f"No ncnn architecture directories found in {package_root}")
+
+
+def ensure_ncnn_package(args: argparse.Namespace, ncnn_root: Path) -> None:
+    config_path = ncnn_config_path(ncnn_root, args.arch)
+    if config_path.is_file():
+        info = detect_ncnn_info(ncnn_root, args.arch)
+        print(
+            "[INFO] ncnn found: "
+            f"version={info['version']} arch={args.arch} "
+            f"linkage={info['linkage']} vulkan={info['vulkan']}"
+        )
+        print(f"[INFO] ncnn config: {config_path}")
+        return
+
+    if args.no_ncnn_download:
+        print(f"[WARN] ncnn config is missing and auto-download is disabled: {config_path}")
+        return
+
+    print(f"[INFO] ncnn package is missing for arch={args.arch}: {config_path}")
+
+    url = DEFAULT_NCNN_URL
+    archive_path = ncnn_root / "_downloads" / package_filename_from_url(url)
+    download_file(url, archive_path)
+
+    with tempfile.TemporaryDirectory(prefix="ncnn-extract-") as temp_dir:
+        extract_dir = Path(temp_dir)
+        safe_extract_zip(archive_path, extract_dir)
+        package_root = find_extracted_ncnn_root(extract_dir)
+        if package_root is None:
+            raise RuntimeError(f"Could not locate ncnnConfig.cmake inside {archive_path}")
+        install_ncnn_package(package_root, ncnn_root)
+
+    if not config_path.is_file():
+        raise RuntimeError(f"ncnn package was installed, but config is still missing: {config_path}")
+
+    info = detect_ncnn_info(ncnn_root, args.arch)
+    print(
+        "[INFO] ncnn ready: "
+        f"version={info['version']} arch={args.arch} "
+        f"linkage={info['linkage']} vulkan={info['vulkan']}"
+    )
+    print(f"[INFO] ncnn config: {config_path}")
+
+
 def main() -> int:
     detected_default_generator = default_generator_key()
     parser = argparse.ArgumentParser(description="Build op_ocr_engine with Visual Studio CMake generators.")
@@ -149,12 +325,23 @@ def main() -> int:
         default="3rd_party/ncnn",
         help="Path to the prebuilt ncnn package root.",
     )
+    parser.add_argument(
+        "--no-ncnn-download",
+        action="store_true",
+        help="Do not auto-download the default prebuilt ncnn package when it is missing.",
+    )
     args = parser.parse_args()
 
     ensure_cmake_on_path()
 
     project_dir = Path(__file__).parent.resolve()
     ncnn_root = resolve_path(project_dir, args.ncnn_root)
+    try:
+        ensure_ncnn_package(args, ncnn_root)
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}")
+        return 1
+
     generator = GENERATORS[args.generator]["cmake"]
     vs_arch = ARCH_TO_VS[args.arch]
     build_dir = project_dir / f"build-{args.generator}-{args.arch}"
