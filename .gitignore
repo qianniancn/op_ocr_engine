@@ -38,6 +38,7 @@ cmake_output.txt
 # Local runtime/test assets
 /3rd_party/
 /images/
+/models/
 /tessdata/
 /tmp/
 
