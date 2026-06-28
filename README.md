@@ -71,8 +71,6 @@ op_ocr_engine/
 
 下载后放到本地 `models/` 目录。默认模型是 `small`。
 
-INT8 是量化模型，文件名里会带 `_int8`。它通常更省内存，CPU 推理也可能更快；代价是识别结果可能有轻微损失，尤其是小字、模糊字和低对比度文字。默认先用普通模型，只有在需要压速度或资源占用时，再用 `--int8` 做对比。
-
 PP-OCRv6 `tiny` 适合只关心速度的场景，比如快速扫按钮、菜单、标题这类界面文字。它启动和推理都比较轻，但遇到小字号、低对比度或密集文字时，稳定性不如 `small`。
 
 `tiny` 必需文件：
@@ -83,17 +81,6 @@ models/
   PP-OCRv6_tiny_det.bin
   PP-OCRv6_tiny_rec.param
   PP-OCRv6_tiny_rec.bin
-  PP-OCRv6_vocab_tiny.txt
-```
-
-`tiny` 可选 INT8 文件，使用 `--int8` 时需要：
-
-```text
-models/
-  PP-OCRv6_tiny_det_int8.param
-  PP-OCRv6_tiny_det_int8.bin
-  PP-OCRv6_tiny_rec_int8.param
-  PP-OCRv6_tiny_rec_int8.bin
   PP-OCRv6_vocab_tiny.txt
 ```
 
@@ -110,17 +97,6 @@ models/
   PP-OCRv6_vocab.txt
 ```
 
-`small` 可选 INT8 文件，使用 `--int8` 时需要：
-
-```text
-models/
-  PP-OCRv6_small_det_int8.param
-  PP-OCRv6_small_det_int8.bin
-  PP-OCRv6_small_rec_int8.param
-  PP-OCRv6_small_rec_int8.bin
-  PP-OCRv6_vocab.txt
-```
-
 PP-OCRv6 `medium` 适合更看重识别质量的截图，比如小字比较多、背景复杂、文字挤在一起的页面。代价是模型更大，推理会比 `small` 慢一些。
 
 `medium` 必需文件：
@@ -134,33 +110,14 @@ models/
   PP-OCRv6_vocab.txt
 ```
 
-`medium` 可选 INT8 文件，使用 `--int8` 时需要：
-
-```text
-models/
-  PP-OCRv6_medium_det_int8.param
-  PP-OCRv6_medium_det_int8.bin
-  PP-OCRv6_medium_rec_int8.param
-  PP-OCRv6_medium_rec_int8.bin
-  PP-OCRv6_vocab.txt
-```
-
 方向分类是通用可选项，用来处理倒置文字。常规窗口截图一般可以不放；如果遇到文字方向不稳定，再加这组模型。
 
-普通模式可放：
+可放：
 
 ```text
 models/
   PP-LCNet_x1_0_textline_ori.param
   PP-LCNet_x1_0_textline_ori.bin
-```
-
-INT8 模式可放：
-
-```text
-models/
-  PP-LCNet_x1_0_textline_ori_int8.param
-  PP-LCNet_x1_0_textline_ori_int8.bin
 ```
 
 表格结构识别不是当前 `ocr_server.exe` 的必需能力。只做文字识别、找字和点击坐标时，不需要下面这些文件。
@@ -287,13 +244,19 @@ ocr_server.exe --model-dir models --model-version v5 --model-type server
 GPU 模式：
 
 ```powershell
-ocr_server.exe --model-dir models --model-type small --device gpu
+ocr_server.exe --model-dir models --model-type small --device gpu --gpu-device 0
 ```
 
-INT8 模式：
+CPU 线程数：
 
 ```powershell
-ocr_server.exe --model-dir models --model-type small --int8
+ocr_server.exe --model-dir models --model-type small --threads 8
+```
+
+快速模式：
+
+```powershell
+ocr_server.exe --model-dir models --model-type small --threads 8 --fast-mode
 ```
 
 默认监听：
@@ -308,13 +271,29 @@ http://127.0.0.1:8082
 --model-dir      模型目录，建议显式传 models
 --model-version  模型版本，v6 或 v5，默认 v6
 --model-type     v6 用 tiny / small / medium，默认 small；v5 用 mobile / server
---int8           加载 *_int8 模型，并打开 ncnn INT8 推理
 --device         cpu / gpu，默认 cpu
+--threads        ncnn CPU 推理线程数，默认 4
+--fast-mode      跳过方向分类和 180 度回退识别，速度更快，但倒置文字鲁棒性会下降
 --host           默认 127.0.0.1
 --port           默认 8082
 ```
 
-`--quality fast|balanced|accurate` 仍然可用，对应 `tiny|small|medium`。新配置优先写 `--model-type`。
+`--fast-mode` 和 `--quality fast` 不一样。`--quality fast` 是兼容别名，等价于选择 v6 `tiny` 模型；`--fast-mode` 不换模型，只是在识别流程里跳过方向分类模型和低置信度时的 180 度回退识别。
+
+GUI 工具启动服务时也使用这些参数：模型版本传 `--model-version`，模型规格传 `--model-type`，线程档位传 `--threads`，勾选快速模式时额外传 `--fast-mode`。
+
+调优和兼容参数：
+
+```text
+--quality       兼容别名：fast / balanced / accurate，对应 v6 tiny / small / medium；不要和 --model-version / --model-type 混用
+--use-vulkan    启用 ncnn Vulkan，等价于 --device gpu
+--gpu-device    Vulkan GPU 设备编号，GPU 模式默认 0
+--fp16          启用 ncnn FP16 arithmetic / storage / packing
+--bf16          启用 ncnn BF16 storage / packing，适合做性能和精度对比
+--backend       auto / ncnn / tesseract，默认 auto
+--datapath      Tesseract tessdata 目录，仅 --backend tesseract 需要
+--lang          Tesseract 语言，默认 eng
+```
 
 开发调试参数可以看：
 
@@ -439,12 +418,6 @@ GPU 对比：
 
 ```powershell
 python tests\benchmark_ncnn_models.py --model-dir models --use-vulkan --gpu-device 0 --threads 4
-```
-
-INT8 对比：
-
-```powershell
-python tests\benchmark_ncnn_models.py --model-dir models --int8
 ```
 
 bbox 可视化：

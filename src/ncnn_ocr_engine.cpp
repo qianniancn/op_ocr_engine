@@ -766,23 +766,23 @@ static bool classify_needs_180(ncnn::Net& cls_net, const uint8_t* bgr, int width
 
 static bool recognize_crop_with_classifier(ncnn::Net& rec_net, ncnn::Net* cls_net, const std::vector<std::string>& dict,
                                            const uint8_t* bgr, int width, int height, bool force_180,
-                                           std::string& text, float& confidence) {
+                                           bool fast_mode, std::string& text, float& confidence) {
     // 竖排长框先转成横向，再交给 PP-OCR 识别模型处理。
     if (height >= static_cast<int>(width * 1.5f)) {
         int rotated_width = 0;
         int rotated_height = 0;
         const auto rotated = rotate_90_counterclockwise_bgr(bgr, width, height, rotated_width, rotated_height);
         return recognize_crop_with_classifier(rec_net, cls_net, dict, rotated.data(), rotated_width, rotated_height,
-                                              force_180, text, confidence);
+                                              force_180, fast_mode, text, confidence);
     }
 
-    if (force_180) {
+    if (!fast_mode && force_180) {
         const auto rotated = rotate_180_bgr(bgr, width, height);
         return recognize_crop(rec_net, dict, rotated.data(), width, height, text, confidence);
     }
 
     bool prefer_180 = false;
-    if (cls_net != nullptr) {
+    if (!fast_mode && cls_net != nullptr) {
         float cls_score = 0.f;
         classify_needs_180(*cls_net, bgr, width, height, prefer_180, cls_score);
     }
@@ -816,6 +816,11 @@ static bool recognize_crop_with_classifier(ncnn::Net& rec_net, ncnn::Net* cls_ne
     }
 
     const bool first_ok = recognize_crop(rec_net, dict, bgr, width, height, first_text, first_confidence);
+    if (fast_mode) {
+        text = std::move(first_text);
+        confidence = first_confidence;
+        return first_ok;
+    }
     if (first_ok && first_confidence >= 0.80f) {
         text = std::move(first_text);
         confidence = first_confidence;
@@ -948,9 +953,6 @@ bool NcnnOcrEngine::init(const NcnnOcrModelPaths& model_paths, const NcnnOcrOpti
         net.opt.use_fp16_arithmetic = options.use_fp16;
         net.opt.use_fp16_storage = options.use_fp16;
         net.opt.use_fp16_packed = options.use_fp16;
-        net.opt.use_int8_arithmetic = options.use_int8;
-        net.opt.use_int8_storage = options.use_int8;
-        net.opt.use_int8_packed = options.use_int8;
         if (options.use_bf16) {
             net.opt.use_fp16_arithmetic = false;
             net.opt.use_fp16_storage = false;
@@ -982,7 +984,9 @@ bool NcnnOcrEngine::init(const NcnnOcrModelPaths& model_paths, const NcnnOcrOpti
     }
 
     impl_->cls_initialized = false;
-    if (!model_paths.cls_param.empty() && !model_paths.cls_bin.empty() &&
+    if (options.fast_mode) {
+        impl_->cls_net.clear();
+    } else if (!model_paths.cls_param.empty() && !model_paths.cls_bin.empty() &&
         fs::exists(model_paths.cls_param) && fs::exists(model_paths.cls_bin)) {
         if (impl_->cls_net.load_param(model_paths.cls_param.c_str()) != 0 ||
             impl_->cls_net.load_model(model_paths.cls_bin.c_str()) != 0) {
@@ -1009,8 +1013,8 @@ bool NcnnOcrEngine::init(const NcnnOcrModelPaths& model_paths, const NcnnOcrOpti
               << " threads=" << std::max(1, options.num_threads)
               << " gpu_device=" << options.gpu_device_id
               << " fp16=" << (options.use_fp16 ? "true" : "false")
-              << " int8=" << (options.use_int8 ? "true" : "false")
               << " bf16=" << (options.use_bf16 ? "true" : "false")
+              << " fast_mode=" << (options.fast_mode ? "true" : "false")
               << " use_vulkan=" << (impl_->use_vulkan ? "true" : "false")
               << std::endl;
     return true;
@@ -1042,7 +1046,8 @@ OcrResponse NcnnOcrEngine::recognize_with_profile(const uint8_t* image, int widt
     const auto det_start = Clock::now();
     const auto boxes = detect_text_boxes(impl_->det_net, bgr, width, height);
     response.profile.det_ms = elapsed_ms(det_start, Clock::now());
-    ncnn::Net* cls_net = impl_->cls_initialized ? &impl_->cls_net : nullptr;
+    const bool fast_mode = impl_->options.fast_mode;
+    ncnn::Net* cls_net = (!fast_mode && impl_->cls_initialized) ? &impl_->cls_net : nullptr;
 
     // 先用所有文本行投票判断整张图是否整体倒置，再逐行识别。
     bool force_180 = false;
@@ -1077,7 +1082,7 @@ OcrResponse NcnnOcrEngine::recognize_with_profile(const uint8_t* image, int widt
         float confidence = 0.f;
         const auto rec_start = Clock::now();
         if (!recognize_crop_with_classifier(impl_->rec_net, cls_net, impl_->character_dict, crop.data(), crop_width,
-                                            crop_height, force_180, text, confidence)) {
+                                            crop_height, force_180, fast_mode, text, confidence)) {
             response.profile.rec_ms += elapsed_ms(rec_start, Clock::now());
             continue;
         }

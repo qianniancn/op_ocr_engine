@@ -107,8 +107,6 @@ def run_variant(args, variant_index, version, model_type, images):
         command += ["--gpu-device", str(args.gpu_device)]
     if args.fp16:
         command.append("--fp16")
-    if args.int8:
-        command.append("--int8")
     if args.bf16:
         command.append("--bf16")
 
@@ -187,7 +185,6 @@ def main():
     parser.add_argument("--use-vulkan", action="store_true")
     parser.add_argument("--gpu-device", type=int, default=None)
     parser.add_argument("--fp16", action="store_true")
-    parser.add_argument("--int8", action="store_true")
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--start-port", type=int, default=18100)
     parser.add_argument("--startup-timeout", type=float, default=30.0)

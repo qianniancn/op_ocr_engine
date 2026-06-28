@@ -29,7 +29,6 @@ static void print_usage(const char* prog, bool advanced = false) {
     std::cout << "Usage: " << prog << " [options]\n"
               << "Options:\n"
               << "  --model-type <type> PP-OCRv6 model type: tiny, small, medium (default: small)\n"
-              << "  --int8              Load *_int8 models and enable ncnn INT8 inference\n"
               << "  --device <device>   Inference device: cpu or gpu (default: cpu)\n"
               << "  --model-dir <path>  Directory containing LiteOCR ncnn models (default: ..\\LiteOCR\\models)\n"
               << "  --port <port>       HTTP listen port (default: 8082)\n"
@@ -50,6 +49,7 @@ static void print_usage(const char* prog, bool advanced = false) {
               << "  --gpu-device <id>   ncnn Vulkan GPU device id (default: 0 when GPU is enabled)\n"
               << "  --threads <n>       ncnn CPU inference thread count (default: 4)\n"
               << "  --fp16              Enable ncnn FP16 arithmetic/storage/packing\n"
+              << "  --fast-mode         Skip direction classifier and 180-degree fallback recognition\n"
               << "  --bf16              Enable ncnn BF16 storage/packing\n";
 }
 
@@ -70,11 +70,10 @@ static fs::path first_existing_path(const fs::path& root, const std::vector<std:
 
 static std::vector<std::string> ocr_model_file_candidates(const std::vector<std::string>& prefixes,
                                                           const std::string& role,
-                                                          const std::string& extension,
-                                                          bool use_int8) {
+                                                          const std::string& extension) {
     std::vector<std::string> names;
     for (const auto& prefix : prefixes) {
-        names.push_back(prefix + "_" + role + (use_int8 ? "_int8." : ".") + extension);
+        names.push_back(prefix + "_" + role + "." + extension);
     }
     return names;
 }
@@ -120,7 +119,6 @@ static bool apply_quality_alias(const std::string& quality, std::string& model_v
 
 static bool resolve_ncnn_model_paths(const fs::path& root, const std::string& model_version,
                                      const std::string& requested_model_type,
-                                     bool use_int8,
                                      ocr::NcnnOcrModelPaths& model_paths,
                                      std::string& resolved_model_type) {
     std::vector<std::string> prefixes;
@@ -157,20 +155,15 @@ static bool resolve_ncnn_model_paths(const fs::path& root, const std::string& mo
         return false;
     }
 
-    model_paths.det_param = first_existing_path(root, ocr_model_file_candidates(prefixes, "det", "param", use_int8)).string();
-    model_paths.det_bin = first_existing_path(root, ocr_model_file_candidates(prefixes, "det", "bin", use_int8)).string();
-    model_paths.rec_param = first_existing_path(root, ocr_model_file_candidates(prefixes, "rec", "param", use_int8)).string();
-    model_paths.rec_bin = first_existing_path(root, ocr_model_file_candidates(prefixes, "rec", "bin", use_int8)).string();
+    model_paths.det_param = first_existing_path(root, ocr_model_file_candidates(prefixes, "det", "param")).string();
+    model_paths.det_bin = first_existing_path(root, ocr_model_file_candidates(prefixes, "det", "bin")).string();
+    model_paths.rec_param = first_existing_path(root, ocr_model_file_candidates(prefixes, "rec", "param")).string();
+    model_paths.rec_bin = first_existing_path(root, ocr_model_file_candidates(prefixes, "rec", "bin")).string();
     model_paths.dict_path = first_existing_path(root, dict_candidates).string();
     set_first_existing_model_pair(root,
-        use_int8
-            ? std::vector<std::pair<std::string, std::string>>{
-                {"PP-LCNet_x1_0_textline_ori_int8.param", "PP-LCNet_x1_0_textline_ori_int8.bin"},
-                {"PP-LCNet_x1_0_textline_ori.param", "PP-LCNet_x1_0_textline_ori.bin"},
-            }
-            : std::vector<std::pair<std::string, std::string>>{
-                {"PP-LCNet_x1_0_textline_ori.param", "PP-LCNet_x1_0_textline_ori.bin"},
-            },
+        std::vector<std::pair<std::string, std::string>>{
+            {"PP-LCNet_x1_0_textline_ori.param", "PP-LCNet_x1_0_textline_ori.bin"},
+        },
         model_paths.cls_param, model_paths.cls_bin);
     return true;
 }
@@ -258,9 +251,9 @@ int main(int argc, char* argv[]) {
 #ifdef OCR_HAS_NCNN
             ncnn_options.use_fp16 = true;
 #endif
-        } else if (arg == "--int8") {
+        } else if (arg == "--fast-mode") {
 #ifdef OCR_HAS_NCNN
-            ncnn_options.use_int8 = true;
+            ncnn_options.fast_mode = true;
 #endif
         } else if (arg == "--bf16") {
 #ifdef OCR_HAS_NCNN
@@ -348,8 +341,7 @@ int main(int argc, char* argv[]) {
         if (model_version_specified && !model_type_specified && model_version == "v5") {
             model_type = "auto";
         }
-        if (!resolve_ncnn_model_paths(root, model_version, model_type, ncnn_options.use_int8, model_paths,
-                                      resolved_model_type)) {
+        if (!resolve_ncnn_model_paths(root, model_version, model_type, model_paths, resolved_model_type)) {
             return 1;
         }
 
@@ -384,8 +376,8 @@ int main(int argc, char* argv[]) {
         std::cout << "Threads: " << ncnn_options.num_threads << std::endl;
         std::cout << "GPU device: " << ncnn_options.gpu_device_id << std::endl;
         std::cout << "FP16: " << (ncnn_options.use_fp16 ? "on" : "off") << std::endl;
-        std::cout << "INT8: " << (ncnn_options.use_int8 ? "on" : "off") << std::endl;
         std::cout << "BF16: " << (ncnn_options.use_bf16 ? "on" : "off") << std::endl;
+        std::cout << "Fast mode: " << (ncnn_options.fast_mode ? "on" : "off") << std::endl;
 #endif
     }
     std::cout << "Version: " << version << std::endl;

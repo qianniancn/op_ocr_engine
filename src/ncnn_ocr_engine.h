@@ -22,8 +22,8 @@ struct NcnnOcrOptions {
     int gpu_device_id = -1;
     int num_threads = 4;
     bool use_fp16 = false;
-    bool use_int8 = false;
     bool use_bf16 = false;
+    bool fast_mode = false;
 };
 
 class NcnnOcrEngine {
